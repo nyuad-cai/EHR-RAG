@@ -1,6 +1,3 @@
-,icd9,icd9_description,icd10,icd10_description,approximate,combination,scenario,choice_list,no_map
-0,022,Cutaneous anthrax,A22,Cutaneous anthrax,0,0,0,0,0
-1,398,Rheumatic myocarditis,I09,Rheumatic myocarditis,0,0,0,0,0
-2,458,Orthostatic hypotension,I95,Orthostatic hypotension,0,0,0,0,0
-3,485,"Bronchopneumonia, organism unspecified",J18,"Bronchopneumonia, unspecified organism",0,0,0,0,0
-4,537,Acquired hypertrophic pyloric stenosis,K31,Adult hypertrophic pyloric stenosis,0,0,0,0,0
+version https://git-lfs.github.com/spec/v1
+oid sha256:d6d9578fcac44a1cd37fd90effa1b1c350456460df6640ef2421d791cc6fe7d5
+size 484
