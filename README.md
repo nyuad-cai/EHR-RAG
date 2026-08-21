@@ -39,7 +39,7 @@
 
 Electronic Health Records (EHR) contain rich longitudinal patient information and are widely used in predictive modeling applications. However, effectively leveraging historical data remains challenging due to long trajectories, heterogeneous events, temporal irregularity, and the varying relevance of past clinical context.
 
-EHR-RAGp is a retrieval-augmented foundation model for structured EHR data that dynamically retrieves and integrates clinically relevant patient history using a prototype-guided retrieval mechanism.
+EHR-RAGp is a retrieval-augmented framework for structured EHR data that dynamically retrieves and integrates clinically relevant patient history using a prototype-guided retrieval mechanism.
 
 The framework:
 - Constructs longitudinal patient trajectory databases
@@ -52,12 +52,12 @@ The framework:
 
 # Key Features
 
-- Retrieval-augmented EHR foundation modeling
+- Retrieval-augmented EHR modeling framework
 - Prototype-guided retrieval alignment
 - Multi-granular chunking strategies
 - Longitudinal patient trajectory modeling
 - MEDS-based standardized EHR representation
-- Compatible with existing EHR foundation models
+- Compatible with existing EHR  models
 - Fully reproducible MIMIC-IV pipeline
 
 ---
@@ -112,7 +112,7 @@ Access requires:
 2. CITI Program training: **Data or Specimens Only Research**
 3. Data usage agreement signage
 
-Raw patient data are NOT distributed in this repository.
+**Note:** Raw patient data are NOT distributed in this repository. Users have to download the raw MIMIC-IV v3.1 dataset on their premises.
 
 ---
 
@@ -120,17 +120,11 @@ Raw patient data are NOT distributed in this repository.
 
 We convert raw MIMIC-IV records into the standardized **Medical Event Data Standard (MEDS)** format.
 
-Official MEDS repository:
-- https://github.com/Medical-Event-Data-Standard
-
-Original MIMIC-IV MEDS extraction pipeline:
-- https://github.com/Medical-Event-Data-Standard/MIMIC_IV_MEDS
-
-Customized EHR-RAGp MEDS extraction pipeline:
-- https://github.com/nyuad-cai/MIMIC_IV_MEDS_EHRRAGP
-- Follow instructions prsent in the customized repository
-
-
+This code works on top of already extracted MIMIC-IV in MEDS format.
+    to use it you need to first extract the dataset in MEDS format using 
+    [MIMIC_IV_MEDS](https://github.com/Medical-Event-Data-Standard/MIMIC_IV_MEDS) (V 0.1.2).
+    post extract, move the MEDS_output directory to data directory. The preprocessing codes runs a stages,
+    the next satge can not start unless the current one finishes.
 ---
 
 # Data Preprocessing
@@ -143,20 +137,23 @@ python preprocess.py
 
 The script performs the full post-MEDS preprocessing workflow, including:
 
-- copying the raw MEDS cohort into the local preprocessing workspace
-- cleaning raw MEDS shards
-- ICD-9 to ICD-10 diagnosis and procedure mapping
-- medication name normalization
-- microbiology event cleaning
-- laboratory event filtering, metadata enrichment, and value normalization
-- ICU event cleaning for chart, procedure, infusion, and fluid-output events
-- removal of patients without hospital admissions
-- removal of empty admissions
-- outpatient and emergency boundary construction
-- time-gap token insertion
-- MEDS-Transforms outlier occlusion
-- MEDS-Transforms numeric normalization
-- conversion of normalized parquet shards into a HuggingFace Arrow dataset
+  1.  Remove HCPCS from patient timelines as they may constitute a tempral leakage (to be updated once resolved)
+  2.  Convert OMR measurement from text_value into numeric_value
+  3.  Segment patient timeline into (e.g., OUTPATIENT, ED, INPATIENT, ICU)
+  4.  Assign visit id to each consecutive visit in the patient timeline (e.g., V1, V2,....)
+  5.  Add time tokens between consecutive visits (e.g., TIME-GAP//1-YR, TIME-GAP//1-M)
+  6.  Add token type anootation (e.g., MEDICATION, LAB_RESULT)
+  7.  Eliminate outliers in numeric_value column
+  8.  Eliminate rare event from vocab and timeline (thereshold >3)
+  9.  Normalize numeric value column
+  10. Event type collection and Tokenizer vocab buidling (vocab.json)
+  11. Build pretraining index from train split (pretrain_idx.parquet)
+  12. Build a readily tokenized full dataset (Arrow format)
+  13. Downstream cohort filtering
+  14. Ground truth labels extraction for downstreak tasks
+  15. Query/History boundaries identification  
+
+
 
 # Vector Index Setup
 

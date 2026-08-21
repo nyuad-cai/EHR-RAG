@@ -1,0 +1,21 @@
+backbone_name: clmbr
+version: with_retrieval_final
+job_id: ${SLURM_JOB_ID}
+
+
+model:
+  model_name: StanfordShahLab/clmbr-t-base
+
+
+
+dataset:
+  data_path: /scratch/sas10092/ehr-foundation/data/ehrshot_clmbr_tokenized_arrow
+  data_idx_path: /scratch/sas10092/ehr-foundation/resources/clmbr_idx.parquet
+  tokenizer_path: /scratch/sas10092/.cache/huggingface/hub/models--StanfordShahLab--clmbr-t-base/snapshots/c7a5f4db6089525e374c2c90372350db3a043d73/clmbr_v8_original_dictionary.json
+  seq_length_q: 512
+
+logger:
+  wandb_api_key: 59b6438e0496b3089f91abef35d31dae69b6c009
+  project: MedEHR_Eval
+  entity: nyuad-cai
+  log_dir: /scratch/sas10092/ehr-foundation/models/clmbr

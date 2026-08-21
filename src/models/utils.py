@@ -23,7 +23,6 @@ def correct_tokenizer_dict(dict_fp:str):
                   "vocab": old_dictionary["regular"]}
     return dictionary
 
-
 BERT_VARIANTS = {
     "bert": {},
     "medbert": dict(
@@ -66,6 +65,7 @@ BERT_VARIANTS = {
 
 
 def get_config_and_model_cls(model_type: str, mode: str = "mlm", variant: str = None):
+
     assert mode in ["mlm", "eval", "causal"]
 
     if model_type not in CONFIG_MAPPING:
@@ -80,11 +80,15 @@ def get_config_and_model_cls(model_type: str, mode: str = "mlm", variant: str = 
     else:
         model_cls = MODEL_FOR_CAUSAL_LM_MAPPING[config_cls]
 
+
     variant_kwargs = {}
+
     if variant is not None and issubclass(config_cls, BertConfig):
-        variant_kwargs = BERT_VARIANTS.get(variant, {})
         if variant not in BERT_VARIANTS:
             raise ValueError(f"Unknown BERT variant: {variant}")
+
+        variant_kwargs = BERT_VARIANTS[variant]
+
 
     def build_config(**kwargs):
         return config_cls(**variant_kwargs, **kwargs)
@@ -290,7 +294,7 @@ TASK_PROMPTS = {
         "Answer only using one word: Yes or No.\n\n"
         "Answer:"
     ),
-    "y_mort_1yr": (
+    "y_mort_12mo": (
         "You are an expert clinical risk prediction model using electronic health records.\n\n"
         "--- PATIENT DATA ---\n"
         "Electronic Health Records:\n"
@@ -369,22 +373,33 @@ def compute_metrics_with_ci_llm(results):
     }
 
 
-def predict_dataset(dataset,
-                    data_idx_path:str,
-                    window: str,
-                    task_name: str, 
-                    model_bundle: dict):
+def predict_dataset(dataset, data_idx_path, window, task_name, model_bundle, split):
+
     results = []
+
     idx = pl.read_parquet(data_idx_path)
-    
-    for i in tqdm(range(len(dataset))):
-        sample = dataset[i]
-        row = idx.filter(pl.col('icustay_id') == int(sample.get("icustay_id")))
-        label = row[task_name][0]
+    test_idx = idx.filter(pl.col("split") == split)
+
+    test_rows = {
+        int(row["icustay_id"]): row
+        for row in test_idx.to_dicts()
+    }
+
+    # build direct lookup once using only the icustay_id column
+    icustay_ids = dataset["icustay_id"]
+
+    hf_lookup = {
+        int(stay_id): i
+        for i, stay_id in enumerate(icustay_ids)
+    }
+
+    for stay_id, row in tqdm(test_rows.items()):
+
+        hf_idx = hf_lookup[stay_id]
+        sample = dataset[hf_idx]
+
         query = sample[window]
-        split = row['split'][0]
-        if split != 'test':
-            continue
+
         prediction = predict_yes_no_probability(
             ehr_text="\n".join(query),
             task_name=task_name,
@@ -392,9 +407,9 @@ def predict_dataset(dataset,
         )
 
         results.append({
-            "subject_id": sample.get("subject_id"),
-            "stay_id": sample.get("icustay_id"),
-            "ground_truth": label,
+            "subject_id": sample["subject_id"],
+            "stay_id": stay_id,
+            "ground_truth": row[task_name],
             "yes_prob": prediction["yes_prob"],
             "no_prob": prediction["no_prob"],
         })

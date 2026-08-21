@@ -1,527 +1,526 @@
 import os
-import yaml
-import shutil
-import random
-import tempfile
-import warnings
-import subprocess
-import pandas as pd
+import shutil 
 
+import polars as pl
 
 from tqdm import tqdm
+from pathlib import Path
 from src.data.utils import *
-from src.data.datasets import SequencesGenerator
-warnings.filterwarnings("ignore")
+from src.data.datasets import Tokenizer, SequencesGenerator
 
-# define data holding directories
-BASE_DIR = os.path.join(".", "data1")
-os.makedirs(BASE_DIR, exist_ok=True)
+"""
+This code works on top of already extracted MIMIC-IV in MEDS format.
+    to use it you need to first extract the dataset in MEDS format using 
+    MIMIC_IV_MEDS[https://github.com/Medical-Event-Data-Standard/MIMIC_IV_MEDS] (V 0.1.2).
+    post extract, move the MEDS_output directory to data directory. The preprocessing codes runs a stages,
+    the next satge can not start unless the current one finishes
+    preprocessing stages performed in this script:
 
-RAW_DIR = os.path.join(BASE_DIR, "raw")
-os.makedirs(RAW_DIR, exist_ok=True)
-
-CLEANED_DIR = os.path.join(BASE_DIR, "cleaned")
-os.makedirs(CLEANED_DIR, exist_ok=True)
-
-CLEANED_DATA_DIR = os.path.join(CLEANED_DIR, "data", "train")
-os.makedirs(CLEANED_DATA_DIR, exist_ok=True)
-
-CLEANED_METADATA_DIR = os.path.join(CLEANED_DIR, "metadata")
-os.makedirs(CLEANED_METADATA_DIR, exist_ok=True)
-
-MED_PHASE1_DIR = os.path.join(BASE_DIR, "med_phase1")
-os.makedirs(MED_PHASE1_DIR, exist_ok=True)
-
-MED_PHASE2_DIR = os.path.join(BASE_DIR, "med_phase2")
-os.makedirs(MED_PHASE2_DIR, exist_ok=True)
-
-MEDS_ARROW_DIR = os.path.join(BASE_DIR, "meds_arrow")
-os.makedirs(MEDS_ARROW_DIR, exist_ok=True)
-
+    1.  Remove HCPCS from patient timelines as they may constitute a tempral leakage (to be updated once resolved)
+    2.  Convert OMR measurement from text_value into numeric_value
+    3.  Segment patient timeline into (e.g., OUTPATIENT, ED, INPATIENT, ICU)
+    4.  Assign visit id to each consecutive visit in the patient timeline (e.g., V1, V2,....)
+    5.  Add time tokens between consecutive visits (e.g., TIME-GAP//1-YR, TIME-GAP//1-M)
+    6.  Add token type anootation (e.g., MEDICATION, LAB_RESULT)
+    7.  Eliminate outliers in numeric_value column
+    8.  Eliminate rare event from vocab and timeline (thereshold >3)
+    9.  Normalize numeric value column
+    10. Event type collection and Tokenizer vocab buidling (vocab.json)
+    11. Build pretraining index from train split (pretrain_idx.parquet)
+    12. Build a readily tokenized full dataset (Arrow format)
+    13. Downstream cohort filtering
+    14. Ground truth labels extraction for downstreak tasks
+    15. Query/History boundaries identification  
+"""
 
 
-# enter the  raw dataset  extracted via MIMIC_IV_MEDS_EHRRAGP
-raw_meds_source = input("Enter path to raw MEDS dataset extracted via MIMIC_IV_MEDS_EHRRAGP, e.g. $ROOT_OUTPUT_DIR: ").strip()
 
-if not os.path.exists(raw_meds_source):
-    raise FileNotFoundError(f"Path does not exist: {raw_meds_source}")
+# Data directory structure building
+data_path = os.path.join('.','data')
+raw_meds_data_path = os.path.join(data_path,'MEDS_output','data')
+raw_meds_metadata_path = os.path.join(data_path,'MEDS_output','metadata')
+splits = [x for x in os.listdir(raw_meds_data_path) if x != ".logs"]
 
-shutil.copytree(raw_meds_source, RAW_DIR, dirs_exist_ok=True)
+processed_path = os.path.join(data_path,'processed')
+processed_data_path = os.path.join(processed_path,'data')
+os.makedirs(processed_data_path, exist_ok=True)
 
-print(f"Raw MEDS data copied to: {RAW_DIR}")
+for split in splits:
+    os.makedirs(os.path.join(processed_data_path, split),exist_ok=True)
 
-dataset_name = raw_meds_source.rstrip("/").split("/")[-1]
+#######################################################################
+# Processing (1-6)
+#######################################################################
 
-raw_dataset_root = os.path.join(RAW_DIR, dataset_name)
+for split in tqdm(splits):
+    print(f'Working on {split} split\n')
+
+    for file in tqdm(os.listdir(os.path.join(raw_meds_data_path,split))):
+        output_file = os.path.join(processed_data_path, split,file)
+
+        if os.path.exists(output_file):
+            print(f"Skipping existing: {split}/{file}\n")
+            continue
+        else:
+            print(f'Working on {file} shard\n')
+            shard = pl.read_parquet(os.path.join(raw_meds_data_path, split, file))
+            # 1.
+            shard = shard.filter(pl.col('code').str.starts_with('HCPCS') == False)
+            # 2. 
+            shard = process_omr_numeric(shard)
+
+            processed = []
+
+            for subject_id in tqdm(shard['subject_id'].unique()):
+                
+                
+                timeline = shard.filter(pl.col('subject_id') == subject_id)
+                # 3.
+                timeline = segment_care_stage(timeline)
+                # 4.
+                timeline = assign_visit_id(timeline)
+                # 5. 
+                timeline = add_time_tokens(timeline)
+                # 6.
+                timeline = add_token_type(timeline)
+
+                processed.append(timeline)
+
+            shard = pl.concat(processed)
+            shard = shard.with_columns(pl.col("numeric_value").alias("numeric_value_original"))
+            shard.write_parquet(output_file)
+            print(f'Finished {file} shard \n')
+    print(f'Finished {split} split \n')
+shutil.copytree(raw_meds_metadata_path, os.path.join(processed_path,'metadata'), dirs_exist_ok=True)
+
+
+#######################################################################
+# Outliers elimination (7,8)
+#######################################################################
+
+
+outliers_path = os.path.join(data_path,'meds_outliers')
+if check_stage_complete(processed_path, outliers_path,splits):
+    print("Skipping outlier removal: stage already completed.")
+else:
+    os.makedirs(outliers_path,exist_ok=True)
+    empty_dir(outliers_path)
+    phase1_config["input_dir"] = processed_path
+    phase1_config["output_dir"] = outliers_path
+    run_meds_transform_from_dict(phase1_config)
+    print('Finished outliers/rare-events cleaning\n')
+
+#######################################################################
+# Normalization (9)
+#######################################################################
+
+normalized_path = os.path.join(data_path, "meds_normalized")
+metadata_path = os.path.join(normalized_path, "metadata", "codes.parquet")
+
+if check_stage_complete(outliers_path, normalized_path, splits):
+    print("Skipping normalization: stage already completed.")
+
+else:
+    os.makedirs(normalized_path, exist_ok=True)
+    empty_dir(normalized_path)
+
+    # Compute fresh post-filtering/post-outlier metadata.
+    phase2_config["input_dir"] = outliers_path
+    phase2_config["output_dir"] = normalized_path
+
+    run_meds_transform_from_dict(phase2_config)
+
+    print("Finished normalization stat computation\n")
+
+
+    code_metadata = pl.read_parquet(metadata_path)
+
+    mean_expr = (
+        pl.col("values/sum")
+        / pl.col("values/n_occurrences")
+    )
+
+    std_expr = (
+        (
+            pl.col("values/sum_sqd")
+            / pl.col("values/n_occurrences")
+        )
+        - mean_expr.pow(2)
+    ).sqrt()
+
+    normalization_metadata = code_metadata.select(
+        "code",
+        mean_expr.alias("values/mean"),
+        std_expr.alias("values/std"),
+    )
+
+    for split in splits:
+        input_split = os.path.join(
+            outliers_path,
+            "data",
+            split,
+        )
+
+        output_split = os.path.join(
+            normalized_path,
+            "data",
+            split,
+        )
+
+        for root, _, files in os.walk(input_split):
+            for filename in tqdm(files):
+                if not filename.endswith(".parquet"):
+                    continue
+
+                input_file = os.path.join(root, filename)
+
+                relative_file = os.path.relpath(
+                    input_file,
+                    input_split,
+                )
+
+                output_file = os.path.join(
+                    output_split,
+                    relative_file,
+                )
+
+                os.makedirs(
+                    os.path.dirname(output_file),
+                    exist_ok=True,
+                )
+
+                print(f"Normalizing {split}/{relative_file}")
+
+                row_idx = "_normalization_row_idx"
+
+                df = pl.scan_parquet(input_file)
+
+                while row_idx in df.collect_schema().names():
+                    row_idx = f"_{row_idx}"
+
+                normalized = (
+                    df
+                    .with_row_index(row_idx)
+                    .join(
+                        normalization_metadata.lazy(),
+                        on="code",
+                        how="inner",
+                        nulls_equal=True,
+                    )
+                    .with_columns(
+                        (
+                            (
+                                pl.col("numeric_value")
+                                - pl.col("values/mean")
+                            )
+                            / pl.col("values/std")
+                        )
+                        .cast(pl.Float32)
+                        .alias("numeric_value")
+                    )
+                    .drop(
+                        "values/mean",
+                        "values/std",
+                    )
+                    .sort(row_idx)
+                    .drop(row_idx)
+                )
+                normalized = normalized.sort([
+                                                "subject_id",
+                                                "event_idx",
+                                                "time"
+                                            ]
+                                        )
+                normalized = normalized.with_columns(
+                    pl.col("event_idx")
+                    .cum_count()
+                    .over("subject_id")
+                    .sub(1)
+                    .alias("event_idx")
+                )
+                normalized.sink_parquet(output_file)
+
+    print("Finished manual normalization\n")
+
+
+#######################################################################
+# Toeknizer fitting (10)
+#######################################################################
 
 resources_path = os.path.join('.','resources')
-raw_data_path = os.path.join(raw_dataset_root,"MEDS_cohort","data", "train",)
-raw_metadata_path = os.path.join(raw_dataset_root,"MEDS_cohort","metadata",)
-labs_metadata_path = os.path.join(resources_path,'mimic-mapping')
-icd_mapping_files_path = os.path.join(resources_path,'icd-code-conversion')
-medications_files_path = os.path.join(resources_path,'medications')
-labs_files_path = os.path.join(resources_path,'labs')
-
-
-shutil.copytree(raw_metadata_path, CLEANED_METADATA_DIR, dirs_exist_ok=True)
-
-files = os.listdir(raw_data_path)
-completed_files = completed_files = os.listdir(CLEANED_DATA_DIR)
-files = [file for file in files if file not in completed_files]
-
-for file in files:
-    if file.endswith('.parquet'):
-        medgemma_rankings_d = pd.read_csv(os.path.join(icd_mapping_files_path,'1-2-many_gems_d_ranked1.csv'))
-        gpt_rankings_d = pd.read_csv(os.path.join(icd_mapping_files_path,'1-2-many_gems_d_ranked_gpt1.csv'))
-
-        medgemma_rankings_p = pd.read_csv(os.path.join(icd_mapping_files_path,'1-2-many_gems_p_ranked1.csv'),dtype={"icd9_code": str, "icd10_code": str})
-        gpt_rankings_p = pd.read_csv(os.path.join(icd_mapping_files_path,'1-2-many_gems_p_ranked_gpt1.csv'),dtype={"icd9_code": str, "icd10_code": str})
-
-        gems_cm_labeled = pd.read_csv(os.path.join(icd_mapping_files_path,'gems_cm_labeled.csv'))
-        high_level_d = pd.read_csv(os.path.join(icd_mapping_files_path,'high_level_d.csv'))
-
-        gems_pcs_labeled = pd.read_csv(os.path.join(icd_mapping_files_path,'gems_pcs_labeled.csv'),dtype={"icd9": str, "icd10": str})
-        high_level_p = pd.read_csv(os.path.join(icd_mapping_files_path,'high_level_p.csv'),dtype={"icd9": str, "icd10": str})
-
-        cleaned_medications = pd.read_csv(os.path.join(medications_files_path,'cleaned_medications.csv'))
-
-        labs_metadata = pd.read_csv(os.path.join(labs_metadata_path,'d_labitems_to_loinc.csv'))
-        labs_dimension = pd.read_csv(os.path.join(labs_metadata_path,'d_labitems.csv')) 
-        cleaned_lab_values = pd.read_csv(os.path.join(labs_files_path,'lab_textual_mapping.csv'))
-
-        icu_items_dimensions = pd.read_csv(os.path.join(labs_metadata_path,'d_items.csv'))
-
-
-        print(f"Processing file: {file}")
-        shard = pd.read_parquet(os.path.join(raw_data_path, file))
-
-        # Patient without hospital admission
-        patients_without_hadm = []
-        for pid in tqdm(shard.subject_id.unique()):
-            patient = shard[shard.subject_id == pid]
-            patient_hadm_id = patient.hadm_id.unique()
-            if patient_hadm_id.shape[0] == 1:
-                patients_without_hadm.append(int(pid))
-
-        # filter
-        shard = shard[shard.subject_id.isin(patients_without_hadm) == False].reset_index(drop=True)    
-        print('1-patients without hadm_id removed')
-
-        # remove table name from code
-        shard['table'] = shard.code.apply(lambda x: x.split('//')[-1])
-        shard.code = shard.code.apply(lambda x: '//'.join(x.split('//')[:-1]))
-        print('2-table names removed')
-
-
-        # handle patient race
-
-        # unify races
-        shard['race'] = shard.code.apply(lambda x: x.split('//')[1] if x.startswith('RACE') else np.nan)
-        shard['code'] = shard.code.apply(lambda x: clean_race(x) if x.startswith('RACE') else x)
+os.makedirs(resources_path,exist_ok=True)
+
+if os.path.exists(os.path.join(resources_path,'vocab.json')):
+    print('vocab already fitted')
+else:
+    event_types = set()
+    split_path = os.path.join(normalized_path, "data", 'train')
 
-        # Step 1: Create base sequential 'filter' column
-        shard["filter"] = range(len(shard))
-
-        # Step 2: Identify RACE rows
-        race_mask = shard["code"].str.contains("RACE", na=False)
-
-        # Step 3: Assign the same filter value for consecutive RACE rows
-        filter_values = []
-        group_id = -1
-        for i, is_race in tqdm(enumerate(race_mask)):
-            if i == 0 or not is_race or not race_mask.iloc[i - 1]:
-                group_id += 1
-            filter_values.append(group_id)
-        shard["filter"] = filter_values
+    for file in tqdm(os.listdir(split_path)):
+        if not file.endswith(".parquet"):
+            continue
+        df = pl.read_parquet(
+            os.path.join(split_path, file),
+            columns=["code_type"]
+        )
 
-        # Step 4: Collapse duplicates by keeping first row per filter group
-        shard = shard.groupby("filter", as_index=False).first()
-        shard.drop(columns=['filter'],inplace=True)
-        patients_with_multiple_races = []
-        for pid in tqdm(shard.subject_id.unique()):
-            patient = shard[shard.subject_id == pid]
-            patient_races = patient[patient.code.str.startswith('RACE')]
-            if patient_races.shape[0] > 2:
-                patients_with_multiple_races.append(int(pid))
-                
-        print(len(patients_with_multiple_races))
-        print('3-race cleaned')
+        event_types.update(
+            df["code_type"]
+            .drop_nulls()
+            .unique()
+            .to_list()
+        )
+    event_types = sorted(event_types)
 
-        # clean outpatient measuerments
-        cleaned_timelines = []
-        for pid in tqdm(shard.subject_id.unique()):
-            patient = shard[shard.subject_id == pid]
-            cleaned_patient = clean_outpatient_measurements(patient)
-            cleaned_timelines.append(cleaned_patient)
 
-        shard = pd.concat(cleaned_timelines).reset_index(drop=True)
-        del(cleaned_timelines)
-        print('4-removed outpatient measurements')
+    tokenizer = Tokenizer(codes_parquet_fp=metadata_path,
+                        special_tokens=['[PAD]', '[MASK]', '[CLS]', '[UNK]'],
+                        event_types=event_types,
+                        force_special_ids=True)
 
-        # clean empty admissions
+    tokenizer.save(os.path.join(resources_path,'vocab.json'))
 
-        empty_hadms = []
-        patients_with_empty_hadms = []
 
-        for pid in tqdm(shard.subject_id.unique()):
-            patient = shard[shard.subject_id == pid]
-            admissions = patient.hadm_id.dropna().unique()
+#######################################################################
+# Pretraining index buidling (11)
+#######################################################################
 
-            for hid in admissions:
-                admission = patient[patient.hadm_id == hid].reset_index(drop=True)
-                age_rows = admission[admission.code.str.startswith('AGE_AT_ADMISSION')]
+pretrain_index_path = os.path.join(resources_path, "pretrain_index.parquet")
 
-                if not age_rows.empty:
-                    idx = age_rows.index[0]
-                    if idx + 1 < len(admission):
-                        next_code = admission.iloc[idx + 1].code
-                        if next_code.startswith('DISCHARGE-FROM-HOSPITAL'):
-                            empty_hadms.append(int(hid))
-                            patients_with_empty_hadms.append(int(pid))
+if os.path.exists(pretrain_index_path):
+    print("Pretrain index already exists.")
 
-        patients_with_single_empty = []
-        for pid in patients_with_empty_hadms:
-            patient = shard[shard.subject_id == pid]
-            hids = patient.hadm_id.unique()
-        #     print(hids.shape[0],pid)
-            if hids.shape[0] == 2:
-                patients_with_single_empty.append(pid)
-                
-        patients_with_empty_hadms = [pid for pid in patients_with_empty_hadms if \
-                                    pid not in patients_with_single_empty]
+else:
 
-        shard = shard[shard.subject_id.isin(patients_with_single_empty) == False].reset_index(drop=True)
+    train_path = os.path.join(
+        normalized_path,
+        "data",
+        "train"
+    )
 
-        shard = shard[(shard.hadm_id.isin(empty_hadms) == False) & 
-                    (shard.out_id.isin(empty_hadms) == False)].reset_index(drop=True) 
-        
-        print('5-empty admissions cleaned')
+    index_rows = []
 
+    for shard in tqdm(os.listdir(train_path)):
 
-        # handle procedure codes
-        shard = push_procedure_and_sort(shard)
-        print('6-procedures cleaned')
+        if not shard.endswith(".parquet"):
+            continue
 
+        shard_path = os.path.join(train_path,shard)
 
-        # get first rankings only
-        medgemma_rankings_d = medgemma_rankings_d.groupby('icd9_code').first().reset_index()
-        gpt_rankings_d = gpt_rankings_d.groupby('icd9_code').first().reset_index()
+        df = pl.read_parquet(shard_path, columns=["subject_id"])
 
-        # drop rank and reason column
-        medgemma_rankings_d = medgemma_rankings_d.iloc[:,:-2]
-        gpt_rankings_d = gpt_rankings_d.iloc[:,:-2]
+        counts = (
+            df
+.group_by("subject_id")
+            .len()
+            .rename({"len": "n_events"})
+            .with_columns(
+                pl.lit(shard).alias("shard"),
+                pl.lit("train").alias("split"),
+            )
+        )
 
-        #merge both tables
-        merged_ranking_d = pd.merge(gpt_rankings_d,medgemma_rankings_d,how='outer',on='icd9_code',suffixes=('_gpt','_medgemma'))
+        index_rows.append(counts)
 
-        # apply final mapping 
-        merged_ranking_d['final'] = merged_ranking_d.apply(lambda x: make_mapping_decesion(x.icd10_code_gpt,x.icd10_code_medgemma),axis=1)
 
+    pretrain_index = pl.concat(index_rows)
 
-        # exact mapping
-        exact_d = gems_cm_labeled[gems_cm_labeled.label == 'exact']
-        exact_mappings_d = dict(zip(exact_d['icd9'],exact_d['icd10']))
+
+    # -------------------------
+    # Create MLM validation split (5%)
+    # -------------------------
+    mlm_val_subjects = (
+        pretrain_index
+        .select("subject_id")
+        .sample(
+            fraction=0.05,
+            seed=42
+        )
+        .get_column("subject_id")
+        .to_list()
+    )
+
+
+    pretrain_index = pretrain_index.with_columns(
+        pl.when(
+            pl.col("subject_id").is_in(mlm_val_subjects)
+        )
+        .then(pl.lit("tuning"))
+        .otherwise(pl.col("split"))
+        .alias("split")
+    )
+
+
+    pretrain_index.write_parquet(pretrain_index_path)
+
+    print("Pretrain index created.")
+
+#######################################################################
+# Arrow dataset building (12)
+#######################################################################
+
+
+arrow_path = os.path.join(data_path, "meds_normalized_arrow")
+arrow_done = os.path.join(arrow_path, ".done")
+
+
+if os.path.exists(arrow_done):
+
+    print("Skipping Arrow dataset creation: already completed.")
+
+else:
+
+    seq_gen = SequencesGenerator(
+        tokenizer_path=os.path.join(resources_path, "vocab.json"),
+        chunk_length=1024, # this is just set for the API correctness, full sequnece will be encoded
+        overlap=128, # this is just set for the API correctness, full sequnece will be encoded
+        return_numeric=True,
+        return_text=True,
+        return_time=True,
+        return_ids=True,
+    )
+
+
+    build_arrow_dataset(
+        normalized_data_dir=normalized_path,
+        writer_batch_size=100,
+        splits=splits,
+        output_dir=arrow_path,
+        seq_gen=seq_gen,
+    )
+    # checkpoint only after successful completion
+    Path(arrow_done).touch()
+
+    print("Finished Arrow dataset creation.")
+
+
+
+#######################################################################
+# Downstream cohort filtering (13)
+# Ground truth labels extraction (14)
+# Query/History boundaries identification (15)
+#######################################################################
+
+icu_downstream_index_path = os.path.join(resources_path, "downstream_index.parquet")
+inpat_downstream_index_path = os.path.join(resources_path, "inpatient_index.parquet")
+raw_downstream_index_path = os.path.join(resources_path, "raw_index.parquet")
+
+if all(os.path.exists(p) for p in [icu_downstream_index_path, inpat_downstream_index_path, raw_downstream_index_path]):
+    print('downstream indices are already done')
+else:
+    # Downstream cohort filtering (13)
+    downstream_idx = build_stay_index(normalized_path=normalized_path,splits=splits)
+    # Exclude patients with no hadm_id
+    downstream_idx = downstream_idx.filter(pl.col('hadm_id').is_not_null())
+    # Exclued admissions with age at admission < 18 years old
+    downstream_idx = downstream_idx.filter(pl.col('age_at_admission')>= 18)
+    # Split cohorts into icu and inpatients admisions
+    icu_downstream_idx = downstream_idx.filter(pl.col('icustay_id').is_not_null())
+    inpatient_downstream_idx= downstream_idx.filter(pl.col('icustay_id').is_null())
+    # Keep hospital admission with single ICU stay only
+    valid_hadm = (
+        icu_downstream_idx
+        .group_by(["subject_id", "hadm_id"])
+        .agg(
+            pl.col("icustay_id").n_unique().alias("n_icu")
+        )
+        .filter(
+            pl.col("n_icu") == 1
+        )
+        .select(
+            ["subject_id", "hadm_id"]
+        )
+    )
+
+    icu_downstream_idx = icu_downstream_idx.join(valid_hadm,on=["subject_id", "hadm_id"],how="inner")
+    # patients whose admission and discharge ICU units are identical
+    icu_downstream_idx = icu_downstream_idx.filter(
+        pl.col("icu_adm_loc").is_not_null()
+        &
+        pl.col("icu_disch_loc").is_not_null()
+        &
+        (pl.col("icu_adm_loc") == pl.col("icu_disch_loc"))
+    )
+    # keep stays with mimimu los of 24 hrs
+    icu_downstream_idx = icu_downstream_idx.filter(
+        pl.col("icu_los").is_not_null()
+        &
+        (pl.col("icu_los") >= 1)
+    )
+    # Ground truth labels extraction (14)
+
+    icu_downstream_idx = get_mortality_labels(icu_downstream_idx)
+
+    icu_downstream_idx = get_los_labels(icu_downstream_idx, durations=[7, 15, 30])
+
+    icu_downstream_idx = get_post_discharge_mortality_labels(icu_downstream_idx, months=[1, 3, 6, 9, 12])
+
+    icu_downstream_idx = get_icu_readmission_labels(icu_downstream_idx, windows=[7, 15, 30])
+
+    # Query/History boundaries identification (15)
+    window_cols = [
+        "w24_min",
+        "w24_max",
+        "w48_min",
+        "w48_max",
+        "wStay_min",
+        "wStay_max",
+    ]
+
+    icu_downstream_idx = icu_downstream_idx.with_columns(
+        [
+            pl.col("icu_adm_idx").alias("w24_min"),
+            pl.col("icu_adm_idx").alias("w48_min"),
+            pl.col("icu_adm_idx").alias("wStay_min"),
+            pl.col("hosp_disch_idx").alias("wStay_max"),
+        ]
+    )
+
+    other_cols = [
+        c for c in icu_downstream_idx.columns
+        if c not in window_cols
+    ]
+
+    icu_downstream_idx = icu_downstream_idx.select(
+        other_cols + window_cols
+    )
+
+
+    # add leakage safe query/history boundaries 
+    icu_downstream_idx = add_query_boundaries(
+        icu_downstream_idx
+    )
+
+    contexts = [512, 1024, 2048]
+    windows = ["w24", "w48", "wStay"]
+
+    conditions = []
+
+    for w in windows:
+        for c in contexts:
+            conditions.append(
+                pl.col(f"{w}_start_{c}") <= pl.col(f"{w}_end_{c}")
+            )
+
+    icu_downstream_idx = icu_downstream_idx.filter(
+        pl.all_horizontal(conditions)
+    )
+
+    for window in windows:
+        for context in contexts:
+            assert (
+                icu_downstream_idx
+                .filter(
+                    pl.col(f"{window}_start_{context}") >
+                    pl.col(f"{window}_end_{context}")
+                )
+                .height
+                == 0
+            ), f"Invalid boundary found for {window}_{context}"
+    print('index created successfully')
+
+    icu_downstream_idx.write_parquet(icu_downstream_index_path)
+    inpatient_downstream_idx.write_parquet(inpat_downstream_index_path)
+    downstream_idx.write_parquet(raw_downstream_index_path)
+    
 
-        # one to one mapping
-        one_to_one_d = gems_cm_labeled[gems_cm_labeled.label == 'one_to_one']
-        one_to_one_mappings_d = dict(zip(one_to_one_d['icd9'],one_to_one_d['icd10']))
-
-        # one to many mapping
-        one_to_many_mappings_d = dict(zip(merged_ranking_d['icd9_code'],merged_ranking_d['final']))
-
-        # high level mapping
-        high_level_mapping_d = dict(zip(high_level_d.icd9,high_level_d.icd10))
-
-        all_mappings = exact_mappings_d | one_to_one_mappings_d | one_to_many_mappings_d | high_level_mapping_d
-
-
-        # all possible mapping
-        shard['icd9_to_icd10_d'] = shard.diag_icd_code.map(all_mappings)
-
-        # combination mapping
-        combinations = gems_cm_labeled[gems_cm_labeled.label == 'combination']
-        combinations = combinations[combinations.scenario == 1]
-        combinations.groupby(['icd9','choice_list']).first().reset_index()
-        combinations = combinations[['icd9','icd10']]
-        shard = shard.merge(combinations,left_on='diag_icd_code',right_on='icd9',how='left')
-        shard.icd9_to_icd10_d = shard.apply(lambda x: x['icd10'] if pd.notna(x['icd10']) else x['icd9_to_icd10_d'], axis=1)
-
-        # no map elimination
-        no_map_code = gems_cm_labeled[gems_cm_labeled.label == 'no_map'].icd9.unique()
-        shard = shard[shard.diag_icd_code.isin(no_map_code) == False].reset_index(drop=True)
-
-        shard = shard[shard.diag_icd_code.isin(['V451','V854','V138','V51','V127','V109','V581','V608','V152','V251','V122',
-                                                'V610','V155','V403','V135']) == False].reset_index(drop=True)
-
-        # unify names
-        shard.code = shard.apply(lambda x:'//'.join([x.code_type,x.icd9_to_icd10_d]) if x.code.startswith('DIAGNOSIS-ICD//9') else x.code,axis=1)
-        shard.code = shard.apply(lambda x:'//'.join([x.code_type,x.diag_icd_code]) if x.code.startswith('DIAGNOSIS-ICD//10') else x.code,axis=1)
-
-        shard.drop(columns=['icd9','icd10'],inplace=True)
-
-
-        print('7-diagnosis codes cleaned')
-
-        # procedure codes mapping
-        # get first rankings only
-        medgemma_rankings_p = medgemma_rankings_p.groupby('icd9_code').first().reset_index()
-        gpt_rankings_p = gpt_rankings_p.groupby('icd9_code').first().reset_index()
-
-        # drop rank and reason column
-        medgemma_rankings_p = medgemma_rankings_p.iloc[:,:-2]
-        gpt_rankings_p = gpt_rankings_p.iloc[:,:-2]
-
-        #merge both tables
-        merged_ranking_p = pd.merge(gpt_rankings_p,medgemma_rankings_p,how='outer',on='icd9_code',suffixes=('_gpt','_medgemma'))
-
-        # apply final mapping 
-        merged_ranking_p['final'] = merged_ranking_p.apply(lambda x: make_mapping_decesion(x.icd10_code_gpt,x.icd10_code_medgemma),axis=1)
-
-
-        # exact mapping
-        exact_p = gems_pcs_labeled[gems_pcs_labeled.label == 'exact']
-        exact_mappings_p = dict(zip(exact_p['icd9'],exact_p['icd10']))
-
-        # one to one mapping
-        one_to_one_p = gems_pcs_labeled[gems_pcs_labeled.label == 'one_to_one']
-        one_to_one_mappings_p = dict(zip(one_to_one_p['icd9'],one_to_one_p['icd10']))
-
-        # one to many mapping
-        one_to_many_mappings_p = dict(zip(merged_ranking_p['icd9_code'],merged_ranking_p['final']))
-
-        # high level mapping
-        high_level_mapping_p = dict(zip(high_level_p.icd9,high_level_p.icd10))
-
-        all_mappings = exact_mappings_p | one_to_one_mappings_p | one_to_many_mappings_p | high_level_mapping_p
-
-
-        # all possible mapping
-        shard['icd9_to_icd10_p'] = shard.proc_icd_code.map(all_mappings)
-
-        # combination mapping
-        combinations = gems_pcs_labeled[gems_pcs_labeled.label == 'combination']
-        combinations = combinations[combinations.scenario == 1]
-        combinations.groupby(['icd9','choice_list']).first().reset_index()
-        combinations = combinations[['icd9','icd10']]
-        shard = shard.merge(combinations,left_on='proc_icd_code',right_on='icd9',how='left')
-        shard.icd9_to_icd10_p = shard.apply(lambda x: x['icd10'] if pd.notna(x['icd10']) else x['icd9_to_icd10_p'], axis=1)
-
-        # no map elimination
-        no_map_code = gems_pcs_labeled[gems_pcs_labeled.label == 'no_map'].icd9.unique()
-        shard = shard[shard.proc_icd_code.isin(no_map_code) == False].reset_index(drop=True)
-
-        shard = shard[shard.proc_icd_code.isin(['857']) == False].reset_index(drop=True)
-
-        # unify names
-        shard.code = shard.apply(lambda x:'//'.join([x.code_type,x.icd9_to_icd10_p]) if x.code.startswith('PROCEDURE-ICD//9') else x.code,axis=1)
-        shard.code = shard.apply(lambda x:'//'.join([x.code_type,x.proc_icd_code]) if x.code.startswith('PROCEDURE-ICD//10') else x.code,axis=1)
-
-        shard.drop(columns=['icd9','icd10'],inplace=True)
-
-
-        print('8-procedure codes cleaned')
-
-        # Medications cleaning
-        cleaned_medications = cleaned_medications.replace(np.nan,None)
-        medication_mapping = dict(zip(cleaned_medications.original_name,cleaned_medications.clean))
-        shard['clean_medication'] = shard.medication.map(medication_mapping)
-        shard = shard[shard.clean_medication.isna() == False]
-        shard.code = shard.apply(lambda x:'//'.join([x.code_type,x.clean_medication]) if x.code.startswith('MEDICATION') else x.code,axis=1)
-        shard = shard[shard.code.str.startswith('MEDICATION//UNK') == False].reset_index(drop=True)
-
-        print('7-medications cleaned')
-
-
-        # Microbiology cleaning
-        shard.code = shard.apply(lambda x:'//'.join([x.code_type, str(int(x.micro_test_itemid)),x.micro_test_name]) if x.code.startswith('MICROBIOLOGY') else x.code,axis=1)
-        shard.micro_org_name = shard.micro_org_name.apply(lambda x: None if x == 'NEGATIVE' else x)
-        shard.micro_org_name = shard.micro_org_name.apply(lambda x: None if x == 'NO GROWTH' else x)
-        shard.micro_spec_type_desc = shard.micro_spec_type_desc.apply(lambda x: 'TISSUE' if x == 'XXX' else x)
-        shard.micro_spec_type_desc = shard.micro_spec_type_desc.apply(lambda x: 'BLOOD CULTURE' if x == '' else x)
-        shard = shard[shard.micro_org_name != 'CANCELLED'].reset_index(drop=True)
-        shard.text_value = shard.apply(lambda x: 'NEGATIVE' if (x.micro_org_name == None) & (x.code_type == 'MICROBIOLOGY') else x.text_value, axis=1)
-
-        print('8-microbiology cleaned')
-
-        not_labs = [50807, 50812, 50829, 50845, 50886, 50887, 50888, 50897, 50919,
-                    50923, 50932, 50933, 50934, 50947, 50955, 50979, 50984, 50985,
-                    51038, 51056, 51103, 51107, 51129, 51571, 51591, 51599, 51600,
-                    51601, 51602, 51603, 51604, 51608, 51612, 51671, 51678, 51698,
-                    51699, 51700, 51702, 51703, 51706, 51712, 51717, 51718, 51719,
-                    51720, 51727, 51752, 51757, 51759, 51760, 51771, 51796, 51806,
-                    51827, 51828, 51830, 51831, 51839, 51901, 51905, 51906, 51907,
-                    51924, 51953, 51955, 51978, 51993, 51995, 51997, 51998, 52014,
-                    52016, 52023, 52025, 52033, 52036, 52043, 52066, 52067, 52068,
-                    52118, 52161, 52186, 52195, 52229, 52230, 52231, 52232, 52233,
-                    52234, 52235, 52236, 52237, 52238, 52239, 52240, 52241, 52242,
-                    52243, 52244, 52245, 52246, 52247, 52248, 52249, 52250, 52251,
-                    52252, 52253, 52254, 52287, 52288, 52289, 52290, 52313, 52314,
-                    52315, 52334, 52370, 52371, 52372, 52374, 52392, 52393, 52405,
-                    52406, 52412, 52415, 52418, 52419, 52420, 52421, 52422, 52423,
-                    53127, 51564, 51597, 51605, 51657, 51658, 51659, 51660, 51661, 
-                    51663, 51664, 51665, 51686, 51732, 51733, 51734, 51735, 51736,
-                    51737, 51762, 51763, 51764, 51765, 51766, 51767, 51768, 51772,
-                    51789, 51817, 51849, 51850, 51851, 51852, 51856, 51857, 51902,
-                    51903, 51904, 51908, 51909, 51916, 51939, 51954, 51956, 51970,
-                    51971, 51973, 52004, 52005, 52006, 52007, 52008, 52009, 52010,
-                    52011, 52012, 52018, 52019, 52020, 52021, 52080, 52081, 52083,
-                    52084, 52110, 52136, 52137, 52147, 52148, 52153, 52169, 52191,
-                    52194, 52215, 52217, 52317, 52318, 52333, 52394, 52395, 52396,
-                    52397, 52398, 52399, 52400, 52401, 52402, 52424, 52425, 52426,
-                    52427, 53122, 51662, 50827, 50828, 51509,51513]
-        
-
-        # Handle labs
-        labs_metadata = labs_metadata.rename(columns={'itemid (omop_source_code)':'itemid'})
-
-
-
-
-        lab_label = dict(zip(labs_dimension['itemid'], labs_dimension['label']))
-        lab_fluid = dict(zip(labs_dimension['itemid'], labs_dimension['fluid']))
-        lab_category = dict(zip(labs_dimension['itemid'], labs_dimension['category']))
-        lab_description = dict(zip(labs_metadata['itemid'], labs_metadata['omop_concept_name']))
-        lab_frequency = dict(zip(labs_metadata['itemid'], labs_metadata['labevents_row_count']))
-        lab_valueuom = dict(zip(labs_metadata['itemid'], labs_metadata['valueuom']))
-
-
-        shard['lab_label'] =  shard.lab_itemid.map(lab_label)
-        shard['lab_fluid'] =  shard.lab_itemid.map(lab_fluid)
-        shard['lab_category'] =  shard.lab_itemid.map(lab_category)
-        shard['lab_description'] =  shard.lab_itemid.map(lab_description)
-        shard['lab_frequency'] =  shard.lab_itemid.map(lab_frequency)
-        shard['lab_valueuom'] =  shard.lab_itemid.map(lab_valueuom)
-
-        shard.lab_label = shard.lab_label.apply(lambda x: x.split(', ')[0] if type(x) == str 
-                                                and ((x.split(', ')[-1] in list(labs_metadata.fluid.unique())) 
-                                                or (x.split(', ')[-1] in ['Body Fluid', 'Other Fluid'])) 
-                                                else x)
-
-
-        shard = shard[shard.lab_itemid.isin(not_labs) == False].reset_index(drop=True)
-        all_values = shard[shard.code_type == 'LAB'].text_value.unique()
-        target_values = cleaned_lab_values.original_values.unique()
-        values = []
-        for value in all_values:
-            if value not in target_values:
-                values.append(value)
-        values = [item for item in values if item is not None]
-        shard = shard[shard.text_value.isin(values) == False].reset_index(drop=True)
-
-        cleaned = dict(zip(cleaned_lab_values.original_values, cleaned_lab_values.clean))
-        shard.text_value = shard.text_value.apply(lambda x: cleaned[x] if x in cleaned.keys() else x)
-
-        numeric = cleaned_lab_values[cleaned_lab_values.numric.notna()]
-        cleaned_numeric = dict(zip(numeric.clean,numeric.numric))
-        shard.numeric_value = shard.apply(lambda x: cleaned_numeric[x.text_value] if (x.text_value in cleaned_numeric.keys()) & (x.code_type == 'LAB') else x.numeric_value,axis=1)
-        shard.text_value = shard.apply(lambda x: None if (x.text_value in cleaned_numeric.keys()) & (x.code_type == 'LAB') else x.text_value, axis=1)
-
-        shard.text_value = shard.apply(lambda x: 'UNKNOWN' if ((pd.isna(x.numeric_value) and pd.isna(x.text_value))
-                                                        or
-                                                            (pd.isna(x.numeric_value) and x.text_value == '___')) 
-                                                        and
-                                                            (x.code_type == 'LAB')
-                                                        else 
-                                                            x.text_value, axis=1)
-
-        shard.code = shard.apply(lambda x: '//'.join([x.code,x.lab_fluid,x.lab_label]) if x.code.startswith('LAB//') else x.code,axis= 1)
-        print('9-labs cleaned')
-
-        # # handle ICU procedures
-        shard = shard[shard.category != '7-Communication'].reset_index(drop=True)
-        shard.code = shard.apply(lambda x:'//'.join([x.code_type,str(int(x.itemid)),x.abbreviation]) if x.code.startswith('ICU-PROCEDURE') else x.code,axis=1)
-
-        print('10-ICU procedures cleaned')
-
-        # ICU fluids_output processing
-        shard.numeric_value = shard.apply(lambda x: abs(x.numeric_value) if x.code_type == 'ICU-FLUID-OUTPUT' else x.numeric_value, axis=1)
-        shard.code = shard.apply(lambda x:'//'.join([x.code_type,str(int(x.itemid)),x.abbreviation]) if x.code_type == 'ICU-FLUID-OUTPUT' else x.code,axis=1)
-
-        print('11-ICU fluids output cleaned')
-
-        # handle infusions
-        shard.code = shard.apply(lambda x:'//'.join([x.code_type,str(int(x.itemid)),x.abbreviation]) if x.code_type == 'ICU-INFUSION' else x.code,axis=1)
-        shard.numeric_value = shard.apply(lambda x: x.amount if x.code_type == 'ICU-INFUSION' else x.numeric_value,axis=1)
-        print('12-ICU infusions cleaned')
-
-        # handle ICU chart 
-        shard.code = shard.apply(lambda x:'//'.join([x.code_type,str(int(x.itemid)),x.abbreviation]) if x.code_type == 'ICU-CHART' else x.code,axis=1)
-        print('13-ICU charts cleaned')
-
-        # unify sequence id
-        shard['seq_id'] = shard.apply(lambda x: next((x[col] for col in ['out_id', 'er_id', 'hadm_id', 'disch_id'] if pd.notna(x[col])), np.nan),axis=1)
-        print('14-sequence id unified')
-
-        # unify value column
-        # shard['value'] = shard.apply(lambda x: x.numeric_value if pd.notna(x.numeric_value) else x.text_value,axis=1)
-        # print('15-value column unified')
-
-
-        # reorder columns
-        columns = ['subject_id', 'seq_id', 'out_id', 'er_id', 'hadm_id', 'icustay_id', 'disch_id',  'time', 'code', 
-                 'numeric_value', 'text_value', 'itemid', 'died_in_hosp', 'icu_los', 'admission_type',
-                 'admission_location', 'discharge_location', 'diag_version', 'diag_icd_code', 'diag_seq_num', 
-                 'drg_severity', 'drg_mortality',  'drg_type', 'drg_code', 'priority', 'specimen_id', 
-                 'lab_lower_limit', 'lab_upper_limit', 'lab_flag', 'lab_unit', 'lab_itemid', 'gender', 
-                 'route', 'frequency', 'doses_per_24_hrs', 'medication', 'proc_seq_num', 'proc_version',
-                 'proc_icd_code', 'micro_specimen_id', 'micro_org_name', 'micro_test_name', 'micro_spec_type_desc', 
-                 'micro_test_itemid', 'icu_care_unit',  'category', 'label', 'abbreviation', 'rate', 'unit', 
-                 'amount', 'amountuom', 'ordercategorydescription', 'ordercategoryname','secondaryordercategoryname', 
-                 'ordercomponenttypedescription', 'table', 'race', 'code_type', 'icd9_to_icd10_d', 'icd9_to_icd10_p',
-                 'clean_medication', 'lab_label', 'lab_fluid', 'lab_category', 'lab_description', 'lab_frequency']
-
-        shard = shard[columns]
-        print('15-columns reordered')
-
-        # handle hadm_id
-        shard.hadm_id = shard.apply(lambda x: np.nan if (x.hadm_id == x.er_id) or (x.hadm_id == x.disch_id) else x.hadm_id, axis= 1)
-        print('16-hadm_id handled')
-        shard.out_id = shard.apply(lambda x: np.nan if x.out_id == x.disch_id else x.out_id, axis= 1)
-        print('17-out_id handled')
-
-        all_patients = []
-        for idx in tqdm(shard.subject_id.unique()):
-            patient = shard[shard.subject_id == idx]
-            patient = add_emer_outp_boundries(patient)
-            patient = add_time_tokens(patient)
-            
-            all_patients.append(patient)
-            
-        shard = pd.concat(all_patients,ignore_index=True)
-        shard.to_parquet(os.path.join(CLEANED_DATA_DIR, file), index=False)
-
-print('Finished all cleaning steps, starting with meds transformation')
-
-
-
-empty_dir(MED_PHASE1_DIR)
-phase1_config["input_dir"] = CLEANED_DIR
-phase1_config["output_dir"] = MED_PHASE1_DIR
-run_meds_transform_from_dict(phase1_config)
-
-
-
-empty_dir(MED_PHASE2_DIR)
-phase2_config["input_dir"] = MED_PHASE1_DIR
-phase2_config["output_dir"] = MED_PHASE2_DIR
-run_meds_transform_from_dict(phase2_config)
-
-
-
-seq_gen = SequencesGenerator(tokenizer_path=os.path.join(resources_path,'vocab.json'),
-                             chunk_length=1024, # this is just set for the API correctness, full sequnece will be encoded
-                             overlap=128, # this is just set for the API correctness, full sequnece will be encoded
-                             return_numeric=True,
-                             return_text=True,
-                             return_time=True,
-                             return_ids=True,)
-
-
-build_arrow_dataset(data_idx_fp=os.path.join(resources_path,"data_idx_full.parquet"),
-                    normalized_train_dir=os.path.join(MED_PHASE2_DIR, "data", "train"),
-                    output_dir= MEDS_ARROW_DIR,
-                    seq_gen=seq_gen)
-
-
-
-        

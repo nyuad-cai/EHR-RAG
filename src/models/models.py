@@ -2,7 +2,7 @@
 import os
 import torch
 
-
+import pandas as pd
 import lightning as lt
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,17 +30,34 @@ class EHREmbeddings(nn.Module):
         time_in_features: int = 1,
         time_out_features: int = 16,
         use_numeric: bool = False,
-        numeric_hidden_size: int = 16,   
+        numeric_hidden_size: int = 16,
+        use_type: bool = True,
+        use_visit: bool = True,
+        use_stage: bool = True,
     ):
         super().__init__()
-
-        self.tok_emb   = nn.Embedding(vocab_size,       embedding_size, padding_idx=pad_token_id)
-        self.type_emb  = nn.Embedding(type_vocab_size,  embedding_size, padding_idx=pad_token_id)
-        self.visit_emb = nn.Embedding(visit_vocab_size, embedding_size, padding_idx=pad_token_id)
-        self.stage_emb = nn.Embedding(stage_vocab_size, embedding_size, padding_idx=pad_token_id)
-
         
+        self.use_type = use_type
+        self.use_visit = use_visit
+        self.use_stage = use_stage
+
+        self.tok_emb   = nn.Embedding(vocab_size, embedding_size, padding_idx=pad_token_id)
+        
+        if use_type:
+            self.type_emb  = nn.Embedding(type_vocab_size,  embedding_size, padding_idx=pad_token_id)
+        else:
+            self.type_emb = None
+        if use_visit:    
+            self.visit_emb = nn.Embedding(visit_vocab_size, embedding_size, padding_idx=pad_token_id)
+        else:
+            self.visit_emb = None
+        if use_stage:
+            self.stage_emb = nn.Embedding(stage_vocab_size, embedding_size, padding_idx=pad_token_id)
+        else:
+            self.stage_emb = None
+
         self.use_position_embeddings = use_position_embeddings
+        
         if use_position_embeddings:
             if max_position_embeddings <= 0:
                 raise ValueError("max_position_embeddings must be > 0 when use_position_embeddings=True")
@@ -50,6 +67,7 @@ class EHREmbeddings(nn.Module):
 
         
         self.use_time = use_time
+        
         if use_time:
             self.time2vec = Time2Vec(
                 in_features=time_in_features,
@@ -63,6 +81,7 @@ class EHREmbeddings(nn.Module):
 
         
         self.use_numeric = use_numeric
+        
         if use_numeric:
             self.numeric_hidden_size = numeric_hidden_size
             
@@ -90,18 +109,29 @@ class EHREmbeddings(nn.Module):
     def encode(
         self,
         input_ids,
-        type_ids,
-        visit_ids,
-        stage_ids,
+        type_ids=None,
+        visit_ids=None,
+        stage_ids=None,
         time_feats=None,          
         numeric_values=None,     
         numeric_mask=None,        
     ):
         
         x = self.tok_emb(input_ids.long())
-        x = x + self.type_emb(type_ids.long())
-        x = x + self.visit_emb(visit_ids.long())
-        x = x + self.stage_emb(stage_ids.long())
+        if self.use_type:
+            if type_ids is None:
+                raise ValueError("type_ids must be provided when use_type=True")
+            x = x + self.type_emb(type_ids.long())
+            
+        if self.use_visit:
+            if visit_ids is None:
+                raise ValueError("visit_ids must be provided when use_visit=True")
+            x = x + self.visit_emb(visit_ids.long())
+            
+        if self.use_stage:
+            if stage_ids is None:
+                raise ValueError("stage_ids must be provided when use_stage=True")
+            x = x + self.stage_emb(stage_ids.long())
 
         
         if self.pos_emb is not None:
@@ -149,13 +179,25 @@ class EHREmbeddings(nn.Module):
 
         return self.drop(self.norm(x))
 
-    def forward(self, input_ids=None, token_type_ids=None, inputs_embeds=None, **kwargs):
+    def forward(
+        self,
+        input_ids=None,
+        inputs_embeds=None,
+        **kwargs,
+    ):
         if inputs_embeds is not None:
             return inputs_embeds
-        x = self.tok_emb(input_ids.long())
-        return self.drop(self.norm(x))
-    
 
+        return self.encode(
+            input_ids=input_ids,
+            type_ids=kwargs.get("type_ids"),
+            visit_ids=kwargs.get("visit_ids"),
+            stage_ids=kwargs.get("stage_ids"),
+            time_feats=kwargs.get("time_feats"),
+            numeric_values=kwargs.get("numeric_values"),
+            numeric_mask=kwargs.get("numeric_mask"),
+        )
+    
 
 class MLMPretraining(lt.LightningModule):
     def __init__(
@@ -166,6 +208,11 @@ class MLMPretraining(lt.LightningModule):
         wd: float = 0.001,
         max_epochs: int = 100,
         dropout: float = 0.1,
+        use_type: bool = True,
+        use_visit: bool = True,
+        use_stage: bool = True,
+        use_time: bool = False,
+        use_numeric: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["backbone"])
@@ -200,12 +247,19 @@ class MLMPretraining(lt.LightningModule):
             visit_vocab_size=config.visit_vocab_size,
             stage_vocab_size=config.stage_vocab_size,
             dropout=dropout,
+            use_type=use_type,
+            use_visit=use_visit,
+            use_stage=use_stage,
+
+            use_time=use_time,
+            use_numeric=use_numeric,
             use_position_embeddings=not is_rope,
             max_position_embeddings=(
                 getattr(config, "max_position_embeddings", 0)
                 if not is_rope
                 else 0
             ),
+            
         )
 
         # tie LM head to token embeddings
@@ -220,16 +274,23 @@ class MLMPretraining(lt.LightningModule):
         self,
         input_ids,
         attention_mask,
-        type_ids,
-        visit_ids,
-        stage_ids,
+        type_ids=None,
+        visit_ids=None,
+        stage_ids=None,
+        time_feats=None,
+        numeric_values=None,
+        numeric_mask=None,
         labels=None,
     ):
+
         inputs_embeds = self.ehr_embeddings.encode(
             input_ids=input_ids,
             type_ids=type_ids,
             visit_ids=visit_ids,
             stage_ids=stage_ids,
+            time_feats=time_feats,
+            numeric_values=numeric_values,
+            numeric_mask=numeric_mask,
         )
 
         return self.backbone(
@@ -245,6 +306,9 @@ class MLMPretraining(lt.LightningModule):
             type_ids=batch["type_ids"],
             visit_ids=batch["visit_ids"],
             stage_ids=batch["stage_ids"],
+            time_feats=batch.get("time_diff", None),
+            numeric_values=batch.get("numeric_values", None),
+            numeric_mask=batch.get("numeric_mask", None),
             labels=batch["labels"],
         )
 
@@ -266,6 +330,9 @@ class MLMPretraining(lt.LightningModule):
             type_ids=batch["type_ids"],
             visit_ids=batch["visit_ids"],
             stage_ids=batch["stage_ids"],
+            time_feats=batch.get("time_diff", None),
+            numeric_values=batch.get("numeric_values", None),
+            numeric_mask=batch.get("numeric_mask", None),
             labels=batch["labels"],
         )
 
@@ -275,8 +342,10 @@ class MLMPretraining(lt.LightningModule):
 
         top1 = self.top_1_val(preds, target)
 
-        self.log("val_loss", loss, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("val_top1", top1,  prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val_top1", top1,  prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        
+        return loss
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.wd)
@@ -293,7 +362,7 @@ class EvalModel(lt.LightningModule):
     def __init__(
         self,
         config,
-        backnone,
+        backbone,
         ckpt_path: str = None,
         lr: float = 2e-5,
         wd: float = 0.001,
@@ -301,25 +370,34 @@ class EvalModel(lt.LightningModule):
         dropout: float = 0.1,
         freeze: bool = False,
         pooling: str = 'cls',
-        use_numeric: bool = True,
-        use_time: bool = True,
-        optimizer: str = 'sgd', 
+        use_type: bool = False,
+        use_visit: bool = False,
+        use_stage: bool = False,
+        use_numeric: bool = False,
+        use_time: bool = False,
+        optimizer: str = 'sgd',
+        prediction_csv_path: str = '.' 
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["backbone"])
         self.pooling = pooling
-        self.backbone = backnone(config)
+        self.backbone = backbone(config)
         self.optimizer = optimizer
         rope_model_types = {"modernbert", "roformer", "mamba"}
         model_type = getattr(config, "model_type", "").lower()
         is_rope = model_type in rope_model_types
 
+        self.prediction_csv_path = prediction_csv_path
         self.train_step_preds = []
-        self.train_step_label = []
+        self.train_step_labels = []
         self.val_step_preds = []
-        self.val_step_label = []
+        self.val_step_labels = []
         self.test_step_preds = []
-        self.test_step_label = []
+        self.test_step_logits = [] 
+        self.test_step_labels = []
+        self.test_step_subject_ids = []
+        self.test_step_hadm_ids = []
+        self.test_step_icustay_ids = []
 
         self.ehr_embeddings = EHREmbeddings(
             vocab_size=config.vocab_size,
@@ -329,6 +407,9 @@ class EvalModel(lt.LightningModule):
             visit_vocab_size=config.visit_vocab_size,
             stage_vocab_size=config.stage_vocab_size,
             dropout=dropout,
+            use_type=use_type,
+            use_visit=use_visit,
+            use_stage=use_stage,
             use_position_embeddings=not is_rope,
             max_position_embeddings=(
                 getattr(config, "max_position_embeddings", 0)
@@ -371,9 +452,9 @@ class EvalModel(lt.LightningModule):
         self,
         input_ids,
         attention_mask,
-        type_ids,
-        visit_ids,
-        stage_ids,
+        type_ids=None,
+        visit_ids=None,
+        stage_ids=None,
         time_feats=None,
         numeric_values=None,  
         numeric_mask=None,    
@@ -414,12 +495,12 @@ class EvalModel(lt.LightningModule):
         logits = self.forward(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
-            type_ids=batch["type_ids"],
-            visit_ids=batch["visit_ids"],
-            stage_ids=batch["stage_ids"],
-            time_feats=batch.get("time_diff", None),
-            numeric_values=batch.get("numeric_values", None),  
-            numeric_mask=batch.get("numeric_mask", None),    
+            type_ids=batch["type_ids"] if self.hparams.use_type else None,
+            visit_ids=batch["visit_ids"] if self.hparams.use_visit else None,
+            stage_ids=batch["stage_ids"] if self.hparams.use_stage else None,
+            time_feats=batch["time_diff"] if self.hparams.use_time else None,
+            numeric_values=batch["numeric_values"] if self.hparams.use_numeric else None,
+            numeric_mask=batch["numeric_mask"] if self.hparams.use_numeric else None,
             labels=None,
         )
 
@@ -428,35 +509,38 @@ class EvalModel(lt.LightningModule):
 
         pos_score = torch.sigmoid(logits)       
 
-        self.train_step_label.append(y)
-        self.train_step_preds.append(pos_score)
+        self.train_step_labels.append(y.detach())
+        self.train_step_preds.append(pos_score.detach())
 
         self.log("train_loss", loss, prog_bar=True, on_epoch=True, logger=True, sync_dist=True)
         return loss
 
     def on_train_epoch_end(self) -> None:
-        y = torch.cat(self.train_step_label)
+        y = torch.cat(self.train_step_labels)
         pos_score = torch.cat(self.train_step_preds)
 
-        auroc = self.train_auroc(pos_score, y.long())
-        auprc = self.train_auprc(pos_score, y.long())
+        gathered_y = self.all_gather(y).reshape(-1)
+        gathered_pos_score = self.all_gather(pos_score).reshape(-1)
+
+        auroc = self.train_auroc(gathered_pos_score, gathered_y.long())
+        auprc = self.train_auprc(gathered_pos_score, gathered_y.long())
 
         self.log('train_auroc', auroc, on_epoch=True, logger=True, prog_bar=False, sync_dist=True)
         self.log('train_auprc', auprc, on_epoch=True, logger=True, prog_bar=False, sync_dist=True)
 
-        self.train_step_label.clear()
+        self.train_step_labels.clear()
         self.train_step_preds.clear()
 
     def validation_step(self, batch, batch_idx):
         logits = self.forward(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
-            type_ids=batch["type_ids"],
-            visit_ids=batch["visit_ids"],
-            stage_ids=batch["stage_ids"],
-            time_feats=batch.get("time_diff", None),
-            numeric_values=batch.get("numeric_values", None),  
-            numeric_mask=batch.get("numeric_mask", None),    
+            type_ids=batch["type_ids"] if self.hparams.use_type else None,
+            visit_ids=batch["visit_ids"] if self.hparams.use_visit else None,
+            stage_ids=batch["stage_ids"] if self.hparams.use_stage else None,
+            time_feats=batch["time_diff"] if self.hparams.use_time else None,
+            numeric_values=batch["numeric_values"] if self.hparams.use_numeric else None,
+            numeric_mask=batch["numeric_mask"] if self.hparams.use_numeric else None,
             labels=None,
         )
 
@@ -464,35 +548,38 @@ class EvalModel(lt.LightningModule):
         loss = self.criterion(logits, y)
         pos_score = torch.sigmoid(logits)
 
-        self.val_step_label.append(y)
-        self.val_step_preds.append(pos_score)
+        self.val_step_labels.append(y.detach())
+        self.val_step_preds.append(pos_score.detach())
 
         self.log("val_loss", loss, prog_bar=True, on_epoch=True, logger=True, sync_dist=True)
         return loss
 
     def on_validation_epoch_end(self,*arg, **kwargs) -> None:
-        y = torch.cat(self.val_step_label)
+        y = torch.cat(self.val_step_labels)
         pos_score = torch.cat(self.val_step_preds)
 
-        auroc = self.val_auroc(pos_score, y.long())
-        auprc = self.val_auprc(pos_score, y.long())
+        gathered_y = self.all_gather(y).reshape(-1)
+        gathered_pos_score = self.all_gather(pos_score).reshape(-1)
+
+        auroc = self.val_auroc(gathered_pos_score, gathered_y.long())
+        auprc = self.val_auprc(gathered_pos_score, gathered_y.long())
 
         self.log('val_auroc', auroc, on_epoch=True, logger=True, prog_bar=True, sync_dist=True)
         self.log('val_auprc', auprc, on_epoch=True, logger=True, prog_bar=True, sync_dist=True)
 
-        self.val_step_label.clear()
+        self.val_step_labels.clear()
         self.val_step_preds.clear()
 
     def test_step(self, batch, batch_idx):
         logits = self.forward(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
-            type_ids=batch["type_ids"],
-            visit_ids=batch["visit_ids"],
-            stage_ids=batch["stage_ids"],
-            time_feats=batch.get("time_diff", None),
-            numeric_values=batch.get("numeric_values", None), 
-            numeric_mask=batch.get("numeric_mask", None),     
+            type_ids=batch["type_ids"] if self.hparams.use_type else None,
+            visit_ids=batch["visit_ids"] if self.hparams.use_visit else None,
+            stage_ids=batch["stage_ids"] if self.hparams.use_stage else None,
+            time_feats=batch["time_diff"] if self.hparams.use_time else None,
+            numeric_values=batch["numeric_values"] if self.hparams.use_numeric else None,
+            numeric_mask=batch["numeric_mask"] if self.hparams.use_numeric else None,
             labels=None,
         )
 
@@ -500,34 +587,78 @@ class EvalModel(lt.LightningModule):
         loss = self.criterion(logits, y)
         pos_score = torch.sigmoid(logits)
 
-        self.test_step_label.append(y)
-        self.test_step_preds.append(pos_score)
+        self.test_step_logits.append(logits.detach())
+        self.test_step_preds.append(pos_score.detach())
+        self.test_step_labels.append(y.detach())
+
+        self.test_step_subject_ids.append(batch["subject_id"])
+        self.test_step_hadm_ids.append(batch["hadm_id"])
+        self.test_step_icustay_ids.append(batch["icustay_id"])
 
         self.log("test_loss", loss, prog_bar=True, on_epoch=True, logger=True)
         return loss    
 
-    def on_test_epoch_end(self,*arg, **kwargs) -> None:
-        y = torch.cat(self.test_step_label)
+    def on_test_epoch_end(self, *arg, **kwargs) -> None:
+
+        y = torch.cat(self.test_step_labels)
         pos_score = torch.cat(self.test_step_preds)
+        logits = torch.cat(self.test_step_logits)
+        subject_ids = torch.cat(self.test_step_subject_ids)
+        hadm_ids = torch.cat(self.test_step_hadm_ids)
+        icustay_ids = torch.cat(self.test_step_icustay_ids)
 
-        auroc = self.test_auroc(pos_score, y.long())
-        auprc = self.test_auprc(pos_score, y.long())
+        gathered_y = self.all_gather(y)
+        gathered_pos_score = self.all_gather(pos_score)
+        gathered_logits = self.all_gather(logits)
 
-        self.log('test_auroc', auroc, on_epoch=True, logger=True)
-        self.log('test_auprc', auprc, on_epoch=True, logger=True)
+        gathered_subject_ids = self.all_gather(subject_ids)
+        gathered_hadm_ids = self.all_gather(hadm_ids)
+        gathered_icustay_ids = self.all_gather(icustay_ids)
+
+        gathered_y = gathered_y.reshape(-1)
+        gathered_pos_score = gathered_pos_score.reshape(-1)
+        gathered_logits = gathered_logits.reshape(-1)
+
+        gathered_subject_ids = gathered_subject_ids.reshape(-1)
+        gathered_hadm_ids = gathered_hadm_ids.reshape(-1)
+        gathered_icustay_ids = gathered_icustay_ids.reshape(-1)
+
+        auroc = self.test_auroc(gathered_pos_score,gathered_y.long())
+        auprc = self.test_auprc(gathered_pos_score,gathered_y.long())
+
+        self.log("test_auroc", auroc, on_epoch=True, logger=True,)
+        self.log("test_auprc", auprc, on_epoch=True,logger=True)
 
         log_bootstrap_ci_text_percentile(
             module=self,
-            y_true=y,
-            y_score=pos_score,
+            y_true=gathered_y,
+            y_score=gathered_pos_score,
             prefix="test",
             num_iter=1000,
             alpha=0.05,
-            ndigits=3,
-        )
+            ndigits=3)
 
-        self.test_step_label.clear()
-        self.test_step_preds.clear()  
+        if self.global_rank == 0:
+
+            results = pd.DataFrame(
+                {
+                    "subject_id": gathered_subject_ids.cpu().numpy(),
+                    "hadm_id": gathered_hadm_ids.cpu().numpy(),
+                    "icustay_id": gathered_icustay_ids.cpu().numpy(),
+                    "label": gathered_y.cpu().numpy(),
+                    "prediction": gathered_pos_score.cpu().numpy(),
+                    "logit": gathered_logits.cpu().numpy(),
+                }
+            )
+
+            results.to_csv(self.prediction_csv_path, index=False)
+
+        self.test_step_labels.clear()
+        self.test_step_preds.clear()
+        self.test_step_logits.clear()
+        self.test_step_subject_ids.clear()
+        self.test_step_hadm_ids.clear()
+        self.test_step_icustay_ids.clear()
 
     def configure_optimizers(self):
 
@@ -564,8 +695,6 @@ class EvalModel(lt.LightningModule):
 
         return {"optimizer": optimizer,"lr_scheduler": scheduler,}
     
-
-
     def get_pretrained_weights(self, ckpt_path: str) -> None:
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)["state_dict"]
 
@@ -1126,6 +1255,7 @@ class EHRRAPEvalModel(lt.LightningModule):
         fusion_ff_mult: int = 4,
         fusion_output_mode: str = "query",
         use_weights_as_gating: bool = False,
+        prediction_csv_path: str = '.'
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["backbone"])
@@ -1179,9 +1309,17 @@ class EHRRAPEvalModel(lt.LightningModule):
         self.test_auroc = BinaryAUROC()
         self.test_auprc = BinaryAveragePrecision()
 
-        self._train_preds, self._train_labels = [], []
-        self._val_preds, self._val_labels = [], []
-        self._test_preds, self._test_labels = [], []
+        self.prediction_csv_path = prediction_csv_path
+        self.train_step_preds = []
+        self.train_step_labels = []
+        self.val_step_preds = []
+        self.val_step_labels = []
+        self.test_step_preds = []
+        self.test_step_logits = [] 
+        self.test_step_labels = []
+        self.test_step_subject_ids = []
+        self.test_step_hadm_ids = []
+        self.test_step_icustay_ids = []
         
 #         if freeze:
 #             for p in self.encoders.parameters():
@@ -1337,14 +1475,19 @@ class EHRRAPEvalModel(lt.LightningModule):
         pos_score = torch.sigmoid(logits)
 
         if stage == "train":
-            self._train_labels.append(y.detach())
-            self._train_preds.append(pos_score.detach())
+            self.train_step_labels.append(y.detach())
+            self.train_step_preds.append(pos_score.detach())
         elif stage == "val":
-            self._val_labels.append(y.detach())
-            self._val_preds.append(pos_score.detach())
+            self.val_step_labels.append(y.detach())
+            self.val_step_preds.append(pos_score.detach())
         elif stage == "test":
-            self._test_labels.append(y.detach())
-            self._test_preds.append(pos_score.detach())
+            self.test_step_logits.append(logits.detach())
+            self.test_step_preds.append(pos_score.detach())
+            self.test_step_labels.append(y.detach())
+
+            self.test_step_subject_ids.append(batch["subject_id"])
+            self.test_step_hadm_ids.append(batch["hadm_id"])
+            self.test_step_icustay_ids.append(batch["icustay_id"])
 
         if proto is not None and "attn_weights" in proto and proto["attn_weights"] is not None and not self.fusion.use_weights_as_gating:
             with torch.no_grad():
@@ -1439,45 +1582,104 @@ class EHRRAPEvalModel(lt.LightningModule):
 
 
     def on_train_epoch_end(self) -> None:
-        if not self._train_preds:
+        if not self.train_step_preds:
             return
-        y = torch.cat(self._train_labels)
-        p = torch.cat(self._train_preds)
-        self.log("train_auroc", self.train_auroc(p, y.long()), on_epoch=True, logger=True, prog_bar=True, sync_dist=True)
-        self.log("train_auprc", self.train_auprc(p, y.long()), on_epoch=True, logger=True, prog_bar=True, sync_dist=True)
-        self._train_labels.clear()
-        self._train_preds.clear()
+
+        y = torch.cat(self.train_step_labels)
+        p = torch.cat(self.train_step_preds)
+
+        gathered_y = self.all_gather(y).reshape(-1)
+        gathered_p = self.all_gather(p).reshape(-1)
+
+        train_auroc = self.train_auroc(gathered_p, gathered_y.long())
+        train_auprc = self.train_auprc(gathered_p, gathered_y.long())
+
+        self.log("train_auroc", train_auroc, on_epoch=True, logger=True,prog_bar=True, sync_dist=True,)
+        self.log("train_auprc", train_auprc, on_epoch=True, logger=True,prog_bar=True,sync_dist=True,)
+
+        self.train_step_labels.clear()
+        self.train_step_preds.clear()
 
     def on_validation_epoch_end(self) -> None:
-        if not self._val_preds:
+        if not self.val_step_preds:
             return
-        y = torch.cat(self._val_labels)
-        p = torch.cat(self._val_preds)
-        self.log("val_auroc", self.val_auroc(p, y.long()), on_epoch=True, logger=True, prog_bar=True, sync_dist=True)
-        self.log("val_auprc", self.val_auprc(p, y.long()), on_epoch=True, logger=True, prog_bar=True, sync_dist=True)
-        self._val_labels.clear()
-        self._val_preds.clear()
 
-    def on_test_epoch_end(self) -> None:
-        if not self._test_preds:
-            return
-        y = torch.cat(self._test_labels)
-        p = torch.cat(self._test_preds)
-        self.log("test_auroc", self.test_auroc(p, y.long()), on_epoch=True, logger=True)
-        self.log("test_auprc", self.test_auprc(p, y.long()), on_epoch=True, logger=True)
+        y = torch.cat(self.val_step_labels)
+        p = torch.cat(self.val_step_preds)
+
+        gathered_y = self.all_gather(y).reshape(-1)
+        gathered_p = self.all_gather(p).reshape(-1)
+
+        val_auroc = self.val_auroc(gathered_p, gathered_y.long())
+        val_auprc = self.val_auprc(gathered_p, gathered_y.long())
+
+        self.log("val_auroc", val_auroc, on_epoch=True, logger=True, prog_bar=True, sync_dist=True)
+        self.log("val_auprc", val_auprc, on_epoch=True, logger=True, prog_bar=True, sync_dist=True)
+
+        self.val_step_labels.clear()
+        self.val_step_preds.clear()
+
+    def on_test_epoch_end(self,*arg, **kwargs) -> None:
+
+        y = torch.cat(self.test_step_labels)
+        pos_score = torch.cat(self.test_step_preds)
+        logits = torch.cat(self.test_step_logits)
+        subject_ids = torch.cat(self.test_step_subject_ids)
+        hadm_ids = torch.cat(self.test_step_hadm_ids)
+        icustay_ids = torch.cat(self.test_step_icustay_ids)
+
+        gathered_y = self.all_gather(y)
+        gathered_pos_score = self.all_gather(pos_score)
+        gathered_logits = self.all_gather(logits)
+
+        gathered_subject_ids = self.all_gather(subject_ids)
+        gathered_hadm_ids = self.all_gather(hadm_ids)
+        gathered_icustay_ids = self.all_gather(icustay_ids)
+
+        gathered_y = gathered_y.reshape(-1)
+        gathered_pos_score = gathered_pos_score.reshape(-1)
+        gathered_logits = gathered_logits.reshape(-1)
+
+        gathered_subject_ids = gathered_subject_ids.reshape(-1)
+        gathered_hadm_ids = gathered_hadm_ids.reshape(-1)
+        gathered_icustay_ids = gathered_icustay_ids.reshape(-1)
+
+        auroc = self.test_auroc(gathered_pos_score,gathered_y.long())
+        auprc = self.test_auprc(gathered_pos_score,gathered_y.long())
+
+        self.log("test_auroc", auroc, on_epoch=True, logger=True,)
+        self.log("test_auprc", auprc, on_epoch=True,logger=True)
 
         log_bootstrap_ci_text_percentile(
             module=self,
-            y_true=y,
-            y_score=p,
+            y_true=gathered_y,
+            y_score=gathered_pos_score,
             prefix="test",
             num_iter=1000,
             alpha=0.05,
-            ndigits=3,
+            ndigits=3)
+
+        if self.global_rank == 0:
+
+            results = pd.DataFrame(
+                {
+                    "subject_id": gathered_subject_ids.cpu().numpy(),
+                    "hadm_id": gathered_hadm_ids.cpu().numpy(),
+                    "icustay_id": gathered_icustay_ids.cpu().numpy(),
+                    "label": gathered_y.cpu().numpy(),
+                    "prediction": gathered_pos_score.cpu().numpy(),
+                    "logit": gathered_logits.cpu().numpy(),
+                }
             )
 
-        self._test_labels.clear()
-        self._test_preds.clear()
+            results.to_csv(self.prediction_csv_path, index=False)
+
+        self.test_step_labels.clear()
+        self.test_step_preds.clear()
+        self.test_step_logits.clear()
+        self.test_step_subject_ids.clear()
+        self.test_step_hadm_ids.clear()
+        self.test_step_icustay_ids.clear()
 
     def configure_optimizers(self):
         param_groups = [

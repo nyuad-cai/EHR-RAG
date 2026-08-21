@@ -10,53 +10,39 @@ import argparse
 
 parser = argparse.ArgumentParser(description='LLM pretraining command line interface')
 parser.add_argument('--model-name', type=str, required=True)
+parser.add_argument('--dataset-path', type=str, required=True)
+parser.add_argument('--data-idx-path', type=str, required=True)
+parser.add_argument('--split', type=str, required=True)
 args = parser.parse_args()
 
 
-os.environ['HUGGINGFACE_HUB_TOKEN'] = "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"
-os.environ["HF_TOKEN"] = "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"
 
-hf_token = os.getenv("HF_TOKEN")
 
-CUSTOM_CACHE = "/scratch/sas10092/huggingface_cache"
-os.environ["HF_HOME"] = CUSTOM_CACHE
-os.environ["TRANSFORMERS_CACHE"] = CUSTOM_CACHE
-os.environ["HUGGINGFACE_HUB_CACHE"] = CUSTOM_CACHE
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-os.environ["TORCH_USE_CUDA_DSA"] = "1"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-os.environ['CC']="/share/apps/NYUAD5/gcc/9.2.0/bin/gcc"
-os.environ['CXX']="/share/apps/NYUAD5/gcc/9.2.0/bin/g++"
-
-# Qwen/Qwen2.5-7B-Instruct
-# google/medgemma-1.5-4b-it
 model_name=args.model_name
 print(model_name)
-dataset_path = "/scratch/sas10092/ehr-foundation/data/desc_gen_dataset"
-data_idx_path = '/scratch/sas10092/ehr-foundation/downstream_idx.parquet'
-dataset = load_from_disk(dataset_path)
 
 
+hf_token = os.getenv("HF_TOKEN")
+dataset = load_from_disk(args.dataset_path)
 
-# window = 'within_stay_descemb'
-# task = 'y_mort_1yr'
-# print('Running task: ', task)
-# bundle = load_hf_model(model_name=model_name, hf_token=hf_token)
-# results = predict_dataset(dataset=dataset, data_idx_path=data_idx_path, window=window, task_name=task, model_bundle=bundle) 
-# metrics = compute_metrics_with_ci_llm(results)
-# print(metrics)
-# del bundle
-# gc.collect()
-# torch.cuda.empty_cache()
-# print('Finished task: ', task)
+window = 'within_stay_genhpf'
+task = 'y_mort_12mo'
+print('Running task: ', task)
+bundle = load_hf_model(model_name=model_name, hf_token=hf_token)
+results = predict_dataset(dataset=dataset, data_idx_path=args.data_idx_path, window=window, task_name=task, model_bundle=bundle, split=args.split) 
+metrics = compute_metrics_with_ci_llm(results)
+print(metrics)
+del bundle
+gc.collect()
+torch.cuda.empty_cache()
+print('Finished task: ', task)
 
 
-window = 'within_stay_descemb'
+window = 'within_stay_genhpf'
 task = 'y_icu_readmit_30'
 print('Running task: ', task)
 bundle = load_hf_model(model_name=model_name, hf_token=hf_token)
-results = predict_dataset(dataset=dataset, data_idx_path=data_idx_path, window=window, task_name=task, model_bundle=bundle) 
+results = predict_dataset(dataset=dataset, data_idx_path=args.data_idx_path, window=window, task_name=task, model_bundle=bundle, split=args.split) 
 metrics = compute_metrics_with_ci_llm(results)
 print(metrics)
 del bundle
@@ -65,11 +51,11 @@ torch.cuda.empty_cache()
 print('Finished task: ', task)
 
 
-window = 'within48_descemb'
+window = 'within48_genhpf'
 task = 'y_mort'
 print('Running task: ', task)
 bundle = load_hf_model(model_name=model_name, hf_token=hf_token)
-results = predict_dataset(dataset=dataset, data_idx_path=data_idx_path, window=window, task_name=task, model_bundle=bundle) 
+results = predict_dataset(dataset=dataset, data_idx_path=args.data_idx_path, window=window, task_name=task, model_bundle=bundle, split=args.split) 
 metrics = compute_metrics_with_ci_llm(results)
 print(metrics)
 del bundle
@@ -78,11 +64,11 @@ torch.cuda.empty_cache()
 print('Finished task: ', task)
 
 
-window = 'within24_descemb'
+window = 'within24_genhpf'
 task = 'y_los_7'
 print('Running task: ', task)
 bundle = load_hf_model(model_name=model_name, hf_token=hf_token)
-results = predict_dataset(dataset=dataset, data_idx_path=data_idx_path, window=window, task_name=task, model_bundle=bundle) 
+results = predict_dataset(dataset=dataset, data_idx_path=args.data_idx_path, window=window, task_name=task, model_bundle=bundle, split=args.split) 
 metrics = compute_metrics_with_ci_llm(results)
 print(metrics)
 del bundle

@@ -2,7 +2,7 @@ import os
 import torch
 import wandb
 import argparse
-
+import functools
 import lightning.pytorch as lt
 
 from torch.utils.data import DataLoader
@@ -52,57 +52,80 @@ def make_dir(p):
     os.makedirs(p, exist_ok=True)
     
 if pretrain_mode in ["mlm","causal"]:
-    ConfigClass, ModelClass = get_config_and_model_cls(backbone_name,mode=pretrain_mode)
+    ConfigClass, ModelClass = get_config_and_model_cls(backbone_name,mode=pretrain_mode,variant=None if baseline in ['transformer','genhpf'] else baseline)
     seq_gen = SequencesGenerator(tokenizer_path= tokenizer_path,
                                 chunk_length=args.chunk_length,
-                                overlap=args.overlap,
-                                return_numeric=False,
-                                return_text=False)
+                                overlap=args.overlap,)
     train_dataset = EHRPretrainDataset(dataset_path=data_path,
-                                    data_idx_path=data_idx_path,
-                                    seq_generator=seq_gen,
-                                    split='train')
+                                       data_idx_path=data_idx_path,
+                                       seq_generator=seq_gen,
+                                       split='train')
     val_dataset = EHRPretrainDataset(dataset_path=data_path,
                                     data_idx_path=data_idx_path,
                                     seq_generator=seq_gen,
-                                    split='val')
+                                    split='tuning')
     if pretrain_mode == "mlm":
-        collate_fn = MLMDataCollator(tokenizer=seq_gen.tokenizer,
-                                    protected_tokens=PROTECTED_TOKENS,
-                                    mask_prob=0.15,
-                                    replace_prob=0.8,
-                                    random_prob=0.1)
+        collate_fn_train = MLMDataCollator(tokenizer=seq_gen.tokenizer,
+                                           protected_tokens=PROTECTED_TOKENS,
+                                           mask_prob=0.15,
+                                           replace_prob=0.8,
+                                           random_prob=0.1,
+                                           structural_dropout=0.15)
+        collate_fn_tune = MLMDataCollator(tokenizer=seq_gen.tokenizer,
+                                          protected_tokens=PROTECTED_TOKENS,
+                                          mask_prob=0.15,
+                                          replace_prob=0.8,
+                                          random_prob=0.1,
+                                          structural_dropout=0.0)
+        train_dataoader = DataLoader(dataset=train_dataset,
+                                    batch_size=args.batch_size,
+                                    num_workers=8,
+                                    shuffle=True,
+                                    collate_fn=collate_fn_train,
+                                    pin_memory=True,
+                                    persistent_workers=True,
+                                    prefetch_factor=4)
+
+        val_dataoader = DataLoader(dataset=val_dataset,
+                                    batch_size=args.batch_size,
+                                    num_workers=8,
+                                    shuffle=True,
+                                    collate_fn=collate_fn_tune,
+                                    pin_memory=True,
+                                    persistent_workers=True,
+                                    prefetch_factor=4)
     elif pretrain_mode == "causal":
         collate_fn = CausalLMDataCollator(tokenizer=seq_gen.tokenizer)
-    train_dataoader = DataLoader(dataset=train_dataset,
-                                batch_size=args.batch_size,
-                                num_workers=8,
-                                shuffle=True,
-                                collate_fn=collate_fn,
-                                pin_memory=True,
-                                persistent_workers=True,
-                                prefetch_factor=4)
-    val_dataoader = DataLoader(dataset=val_dataset,
-                                batch_size=args.batch_size,
-                                num_workers=8,
-                                shuffle=True,
-                                collate_fn=collate_fn,
-                                pin_memory=True,
-                                persistent_workers=True,
-                                prefetch_factor=4)
+        train_dataoader = DataLoader(dataset=train_dataset,
+                                    batch_size=args.batch_size,
+                                    num_workers=8,
+                                    shuffle=True,
+                                    collate_fn=collate_fn,
+                                    pin_memory=True,
+                                    persistent_workers=True,
+                                    prefetch_factor=4)
+
+        val_dataoader = DataLoader(dataset=val_dataset,
+                                    batch_size=args.batch_size,
+                                    num_workers=8,
+                                    shuffle=True,
+                                    collate_fn=collate_fn,
+                                    pin_memory=True,
+                                    persistent_workers=True,
+                                    prefetch_factor=4)
     if pretrain_mode == "mlm":
         cfg = ConfigClass(vocab_size=seq_gen.tokenizer.vocab_size,
                           cls_token_id=seq_gen.tokenizer.cls_id,
                           pad_token_id=seq_gen.tokenizer.pad_id,
-                          type_vocab_size=28,
-                          visit_vocab_size=102,
+                          type_vocab_size=43,
+                          visit_vocab_size=990,
                           stage_vocab_size=5,
                           refernece_compile=False)
     elif pretrain_mode == "causal":
         cfg = ConfigClass(vocab_size=seq_gen.tokenizer.vocab_size,
                           pad_token_id=seq_gen.tokenizer.pad_id,
-                          type_vocab_size=28,
-                          visit_vocab_size=102,
+                          type_vocab_size=43,
+                          visit_vocab_size=990,
                           stage_vocab_size=5,
                           use_mambapy=True)
     cfg = fix_roberta_longformer_max_pos(cfg)
@@ -112,13 +135,23 @@ if pretrain_mode in ["mlm","causal"]:
                                        backbone=ModelClass,
                                        lr=args.learning_rate,
                                        wd=args.weight_decay,
-                                       max_epochs=args.max_epoch)
+                                       max_epochs=args.max_epochs,
+                                       use_type=True,
+                                       use_visit=True,
+                                       use_stage=True,
+                                       use_time=True,
+                                       use_numeric=True)
     elif pretrain_mode == "mlm":    
         model = MLMPretraining(config=cfg,
                                backbone=ModelClass,
                                lr=args.learning_rate,
                                wd=args.weight_decay,
-                               max_epochs=args.max_epochs)
+                               max_epochs=args.max_epochs,
+                               use_type=True,
+                               use_visit=True,
+                               use_stage=True,
+                               use_time=True,
+                               use_numeric=True)
         
 elif pretrain_mode == "simclr":
     train_dataset= GenHPFSimCLRDataset(dataset_path=data_path,
@@ -126,14 +159,14 @@ elif pretrain_mode == "simclr":
                                        seq_field='within_stay_remed',
                                        split="train",
                                        tokenizer_name="emilyalsentzer/Bio_ClinicalBERT",
-                                       max_events=511,
+                                       max_events=510,
                                        max_tokens=64)
     val_dataset= GenHPFSimCLRDataset(dataset_path=data_path,
                                      data_idx_path=data_idx_path,
                                      seq_field='within_stay_remed',
-                                     split="val",
+                                     split="tuning",
                                      tokenizer_name="emilyalsentzer/Bio_ClinicalBERT",
-                                     max_events=511,
+                                     max_events=510,
                                      max_tokens=64)
     
     collate_fn = GenHPFSimCLRCollator(pad_token_id=train_dataset.tokenizer.pad_token_id,
@@ -168,7 +201,7 @@ elif pretrain_mode == "simclr":
                             agg_attention_heads=4,
                             dropout=0.3,
                             max_token_len=64,   
-                            max_events=511,
+                            max_events=510,
                             encoder_only=False)
 
     model = GenHPFSimCLRModule(encoder=encoder,
@@ -178,8 +211,7 @@ elif pretrain_mode == "simclr":
                                temperature=0.1)
     
 wandb.login(key=wandb_api_key)
-wandb_logger = WandbLogger(project='MedEHR_Pretraining',
-                           entity='nyuad-cai',
+wandb_logger = WandbLogger(project='ehr-ragp-pretraining',
                            save_dir=log_dir,
                            version=f'{backbone_name}_{baseline}_{job_id}_{args.chunk_length}_{args.overlap}_{version}',
                            name=f'{backbone_name}_{baseline}_{job_id}_{args.learning_rate}_{args.chunk_length}_{args.overlap}_{version}',
@@ -191,9 +223,9 @@ checkpoint_callback = ModelCheckpoint(dirpath=ckpt_dir,
                                       monitor='val_loss', 
                                       mode='min',
                                       every_n_epochs=1,
-                                      save_top_k=5,)
+                                      save_top_k=3,)
 early_stop = EarlyStopping(monitor='val_loss', 
-                        min_delta=0.001,
+                        min_delta=0.0005,
                         mode='min', 
                         patience=5)
 lr_monitor = LearningRateMonitor(logging_interval='epoch')
@@ -206,18 +238,11 @@ def main():
                         log_every_n_steps=1,
                         num_sanity_val_steps=0,
                         max_epochs=args.max_epochs,
+                        enable_progress_bar=True,
                         precision='16-mixed', 
                         callbacks=[checkpoint_callback,early_stop,lr_monitor]
                         )
-    # tuner = Tuner(trainer)
 
-    # lr_finder = tuner.lr_find(model,
-    #                           train_dataloaders=train_dataoader,
-    #                           num_training=200, 
-    #                           method='fit',
-    #                           mode='exponential', 
-    #                           update_attr=True)
-    # print(f"Suggested learning rate: {lr_finder.suggestion()}") 
 
     trainer.fit(model=model, train_dataloaders=train_dataoader, val_dataloaders=val_dataoader)
 

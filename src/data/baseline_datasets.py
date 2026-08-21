@@ -54,6 +54,7 @@ class DescEmbDataset(Dataset):
     def __getitem__(self, idx: int):
         row = self.data_idx.row(idx, named=True)
         sid = int(row["subject_id"])
+        hadm = int(row["hadm_id"])
         icu = int(row["icustay_id"])
         y = row[self.task]
 
@@ -80,6 +81,7 @@ class DescEmbDataset(Dataset):
 
         return {
             "subject_id": sid,
+            "hadm_id": hadm,
             "icustay_id": icu,
             "input_ids": enc["input_ids"].long(),
             "attention_mask": enc["attention_mask"].long(),
@@ -120,6 +122,21 @@ class DescEmbCollator:
             "attention_mask": attention_mask,
             "seq_len": seq_len,
             "label": labels,
+
+            "subject_id": torch.tensor(
+                [b["subject_id"] for b in batch],
+                dtype=torch.long,
+            ),
+
+            "hadm_id": torch.tensor(
+                [b["hadm_id"] for b in batch],
+                dtype=torch.long,
+            ),
+
+            "icustay_id": torch.tensor(
+                [b["icustay_id"] for b in batch],
+                dtype=torch.long,
+            ),
         }
     
 
@@ -164,6 +181,7 @@ class HierarchicalGenHPFDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row = self.data_idx.iloc[idx]
         subject_id = int(row["subject_id"])
+        hadm_id = int(row["hadm_id"])
         icustay_id = int(row["icustay_id"])
 
         key = (subject_id, icustay_id)
@@ -194,6 +212,9 @@ class HierarchicalGenHPFDataset(Dataset):
 
         out: Dict[str, Any] = {
             "input_ids": input_ids,
+            "subject_id": subject_id,
+            "hadm_id": hadm_id,
+            "icustay_id": icustay_id,
         }
 
         if self.label_field is not None:
@@ -239,6 +260,21 @@ class GenHPFEvalCollator:
         if "label" in batch[0] and batch[0]["label"] is not None:
             labels = torch.stack([b["label"] for b in batch])  # (B,)
             out["label"] = labels
+
+        out["subject_id"] = torch.tensor(
+            [b["subject_id"] for b in batch],
+            dtype=torch.long,
+        )
+
+        out["hadm_id"] = torch.tensor(
+            [b["hadm_id"] for b in batch],
+            dtype=torch.long,
+        )
+
+        out["icustay_id"] = torch.tensor(
+            [b["icustay_id"] for b in batch],
+            dtype=torch.long,
+        )
 
         return out
     
@@ -451,6 +487,7 @@ class REMedGenHPFPoolDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row = self.data_idx.iloc[idx]
         subject_id = int(row["subject_id"])
+        hadm_id = int(row["hadm_id"])
         icustay_id = int(row["icustay_id"])
 
         key = (subject_id, icustay_id)
@@ -508,6 +545,7 @@ class REMedGenHPFPoolDataset(Dataset):
             "times_ts": times_sel,                    
             "time_diff": torch.from_numpy(td_sel),    
             "subject_id": torch.tensor(subject_id, dtype=torch.int64),
+            "hadm_id": torch.tensor(hadm_id, dtype=torch.int64),
             "icustay_id": torch.tensor(icustay_id, dtype=torch.int64),
         }
 
@@ -597,6 +635,19 @@ class REMedGenHPFCollator:
         if "label" in batch[0] and batch[0]["label"] is not None:
             out["label"] = torch.stack([b["label"] for b in batch])
 
+
+        out["subject_id"] = torch.stack(
+            [b["subject_id"] for b in batch]
+        )
+
+        out["hadm_id"] = torch.stack(
+            [b["hadm_id"] for b in batch]
+        )
+
+        out["icustay_id"] = torch.stack(
+            [b["icustay_id"] for b in batch]
+        )
+
         return out
     
 
@@ -609,21 +660,62 @@ class CausalLMDataCollator:
         self.tokenizer = tokenizer
 
     def __call__(self, batch):
+
         chunks = []
+
         for item in batch:
-            if isinstance(item, dict): chunks.append(item)
-            else: chunks.extend(item)
+            if isinstance(item, dict):
+                chunks.append(item)
+            else:
+                chunks.extend(item)
 
-        keys = [k for k in chunks[0].keys() if k not in ("text_values",)]
-        out = {k: torch.stack([torch.as_tensor(c[k]) for c in chunks], 0) for k in keys}
+        keys = [
+            k for k in chunks[0].keys()
+            if k not in ("text_values",)
+        ]
 
+        out = {
+            k: torch.stack(
+                [torch.as_tensor(c[k]) for c in chunks],
+                0
+            )
+            for k in keys
+        }
+
+
+        # Clean numeric values
+        if "numeric_values" in out:
+
+            vals = out["numeric_values"].float()
+
+            finite_mask = torch.isfinite(vals)
+
+            if "numeric_mask" in out:
+                mask = out["numeric_mask"].bool() & finite_mask
+            else:
+                mask = finite_mask
+
+            vals = torch.nan_to_num(vals,nan=0.0,posinf=0.0,neginf=0.0,)
+
+            out["numeric_values"] = vals
+            out["numeric_mask"] = mask
+
+
+        # Clean time features
+        if "time_diff" in out:
+
+            t = out["time_diff"].float()
+
+            t = torch.nan_to_num(t, nan=0.0,posinf=0.0,neginf=0.0,)
+
+            out["time_diff"] = t
+
+        # Causal LM labels
         labels = out["input_ids"].clone()
-        pad = self.tokenizer.pad_id if self.tokenizer.pad_id is not None else 0
+        pad = (self.tokenizer.pad_id if self.tokenizer.pad_id is not None else 0)
         labels[labels == pad] = -100
-
         if self.tokenizer.cls_id is not None:
             labels[out["input_ids"] == self.tokenizer.cls_id] = -100
-
         out["labels"] = labels
         return out
     
